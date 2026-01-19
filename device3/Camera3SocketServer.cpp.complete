@@ -1,0 +1,215 @@
+/*
+ * Copyright (C) 2026 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// 个人修改开始
+#define LOG_TAG "AIDOCK_CAM_DECODER"
+#include <utils/Log.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/stat.h>
+
+#include "Camera3SocketServer.h"
+#include "Camera3H264Decoder.h"
+#include "Camera3StreamInjectionManager.h"
+
+namespace android {
+namespace camera3 {
+
+const char* Camera3SocketServer::kAbstractSocketName = "aidock_cam_h264";
+
+Camera3SocketServer::Camera3SocketServer() :
+        Thread(false),
+        mServerSocket(-1),
+        mClientSocket(-1),
+        mRunning(false),
+        mCurrentWidth(1080),
+        mCurrentHeight(720) {
+    mDecoder = new Camera3H264Decoder();
+}
+
+Camera3SocketServer::~Camera3SocketServer() {
+    stop();
+}
+
+status_t Camera3SocketServer::start() {
+    std::lock_guard<std::mutex> lock(mLock);
+    if (mRunning) return OK;
+
+    // 个人修改开始
+    mServerSocket = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (mServerSocket < 0) {
+        ALOGE("标记: 无法创建 Unix socket: %s", strerror(errno));
+        return UNKNOWN_ERROR;
+    }
+
+    struct sockaddr_un serv_addr;
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sun_family = AF_UNIX;
+    serv_addr.sun_path[0] = '\0';
+    strncpy(serv_addr.sun_path + 1, kAbstractSocketName, sizeof(serv_addr.sun_path) - 2);
+
+    socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(kAbstractSocketName);
+
+    if (bind(mServerSocket, (struct sockaddr *)&serv_addr, len) < 0) {
+        ALOGE("标记: 抽象 Socket 绑定失败 (@%s): %s", kAbstractSocketName, strerror(errno));
+        close(mServerSocket);
+        mServerSocket = -1;
+        return UNKNOWN_ERROR;
+    }
+    // 个人修改结束
+
+    if (listen(mServerSocket, 1) < 0) {
+        ALOGE("标记: 监听失败: %s", strerror(errno));
+        close(mServerSocket);
+        mServerSocket = -1;
+        return UNKNOWN_ERROR;
+    }
+
+    mRunning = true;
+    run("Camera3SocketServer", PRIORITY_URGENT_DISPLAY);
+    ALOGI("标记: Unix Domain Socket 服务器已在抽象命名空间 @%s 启动", kAbstractSocketName);
+
+    return OK;
+}
+
+void Camera3SocketServer::stop() {
+    {
+        std::lock_guard<std::mutex> lock(mLock);
+        if (!mRunning) return;
+        mRunning = false;
+    }
+
+    if (mServerSocket != -1) {
+        close(mServerSocket);
+        mServerSocket = -1;
+    }
+    if (mClientSocket != -1) {
+        close(mClientSocket);
+        mClientSocket = -1;
+    }
+
+    requestExitAndWait();
+    mDecoder->release();
+    ALOGI("标记: Unix Domain Socket 服务器已停止");
+}
+
+bool Camera3SocketServer::threadLoop() {
+    while (mRunning) {
+        // 个人修改开始
+        struct sockaddr_un cli_addr;
+        socklen_t clilen = sizeof(cli_addr);
+        
+        ALOGI("标记: 等待抽象 Unix socket 客户端连接...");
+        int newsockfd = accept(mServerSocket, (struct sockaddr *) &cli_addr, &clilen);
+        // 个人修改结束
+        
+        if (newsockfd < 0) {
+            if (mRunning) ALOGE("标记: accept 错误: %s", strerror(errno));
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mLock);
+            if (mClientSocket != -1) {
+                ALOGW("标记: 拒绝新的连接，已有客户端在连接中");
+                close(newsockfd);
+                continue;
+            }
+            mClientSocket = newsockfd;
+        }
+
+        ALOGI("标记: Unix socket 客户端已连接");
+        handleClient();
+
+        {
+            std::lock_guard<std::mutex> lock(mLock);
+            close(mClientSocket);
+            mClientSocket = -1;
+        }
+        ALOGI("标记: Unix socket 客户端已断开");
+    }
+    return false;
+}
+
+void Camera3SocketServer::handleClient() {
+    uint8_t buffer[65536];
+    ALOGI("标记: 客户端已连接，准备按需初始化解码器");
+    
+    // 只有在连接时才初始化解码器
+    if (mDecoder->initialize(mCurrentWidth, mCurrentHeight) != OK) {
+        ALOGE("标记: 解码器按需初始化失败");
+        return;
+    }
+
+    while (mRunning) {
+        ssize_t n = read(mClientSocket, buffer, sizeof(buffer));
+        if (n <= 0) {
+            if (n < 0) ALOGE("标记: Socket 读取错误: %s", strerror(errno));
+            else ALOGI("标记: 客户端主动断开连接");
+            break;
+        }
+
+        // ALOGV("标记: Socket 接收到 %zd 字节原始数据", n);
+        parseAnnexB(buffer, n);
+    }
+
+    // 客户端断开，立即释放解码器并停止注入
+    ALOGI("标记: 客户端断开，正在清理资源...");
+    mDecoder->release();
+    Camera3StreamInjectionManager::getInstance()->setInjectionActive(false);
+}
+
+bool Camera3SocketServer::parseAnnexB(uint8_t* buffer, size_t size) {
+    static std::vector<uint8_t> frameBuffer;
+    if (frameBuffer.capacity() < 1024 * 1024) frameBuffer.reserve(1024 * 1024);
+
+    size_t lastPos = 0;
+    for (size_t i = 0; i <= (size >= 4 ? size - 4 : 0); ++i) {
+        if (buffer[i] == 0x00 && buffer[i+1] == 0x00 && buffer[i+2] == 0x00 && buffer[i+3] == 0x01) {
+            if (i > lastPos || !frameBuffer.empty()) {
+                frameBuffer.insert(frameBuffer.end(), buffer + lastPos, buffer + i);
+                if (frameBuffer.size() > 4) {
+                    detectResolutionChange(frameBuffer.data(), frameBuffer.size());
+                    mDecoder->decode(frameBuffer.data(), frameBuffer.size());
+                }
+                frameBuffer.clear();
+            }
+            frameBuffer.insert(frameBuffer.end(), {0x00, 0x00, 0x00, 0x01});
+            i += 3;
+            lastPos = i + 1;
+        }
+    }
+    if (lastPos < size) frameBuffer.insert(frameBuffer.end(), buffer + lastPos, buffer + size);
+    return true;
+}
+
+void Camera3SocketServer::detectResolutionChange(uint8_t* nalData, size_t size) {
+    if (size < 5) return;
+    uint8_t nalType = nalData[4] & 0x1F;
+    if (nalType == 7) { // SPS (Sequence Parameter Set)
+        // 这是一个简化的解析，实际中需要完整的 H.264 bitstream 解析。
+        // 这里我们主要依赖 MediaCodec 的 INFO_OUTPUT_FORMAT_CHANGED。
+        // 但为了 FR-004，我们可以在这里做初步标记。
+    }
+}
+
+} // namespace camera3
+} // namespace android
+// 个人修改结束
+

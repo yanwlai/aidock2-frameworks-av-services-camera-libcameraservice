@@ -1,0 +1,138 @@
+/*
+ * Copyright (C) 2026 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// 个人修改开始
+#define LOG_TAG "AIDOCK_CAM_DECODER"
+#include <utils/Log.h>
+#include <media/NdkMediaCodec.h>
+#include <media/NdkMediaFormat.h>
+
+#include "Camera3H264Decoder.h"
+
+namespace android {
+namespace camera3 {
+
+Camera3H264Decoder::Camera3H264Decoder() :
+        mCodec(nullptr),
+        mInitialized(false) {
+}
+
+Camera3H264Decoder::~Camera3H264Decoder() {
+    release();
+}
+
+status_t Camera3H264Decoder::initialize() {
+    if (mInitialized) return OK;
+
+    mCodec = AMediaCodec_createDecoderByType("video/avc");
+    if (!mCodec) {
+        ALOGE("标记: 无法创建 H.264 解码器");
+        return UNKNOWN_ERROR;
+    }
+
+    AMediaFormat* format = AMediaFormat_new();
+    AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, "video/avc");
+    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, 1080);
+    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, 720);
+    // 设置 NV21 (YUV420 semi-planar)
+    // 注意：MediaCodec 实际上通常输出 YUV420Planar 或 SemiPlanar
+    // 这里简单配置，实际可能需要根据硬件转换
+    // COLOR_FormatYUV420SemiPlanar = 21
+    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_COLOR_FORMAT, 21);
+
+    media_status_t status = AMediaCodec_configure(mCodec, format, nullptr, nullptr, 0);
+    AMediaFormat_delete(format);
+
+    if (status != AMEDIA_OK) {
+        ALOGE("标记: 解码器配置失败: %d", status);
+        AMediaCodec_delete(mCodec);
+        mCodec = nullptr;
+        return UNKNOWN_ERROR;
+    }
+
+    status = AMediaCodec_start(mCodec);
+    if (status != AMEDIA_OK) {
+        ALOGE("标记: 解码器启动失败: %d", status);
+        AMediaCodec_delete(mCodec);
+        mCodec = nullptr;
+        return UNKNOWN_ERROR;
+    }
+
+    mInitialized = true;
+    ALOGI("标记: H.264 解码器已初始化 (1080x720)");
+    return OK;
+}
+
+void Camera3H264Decoder::release() {
+    if (mCodec) {
+        AMediaCodec_stop(mCodec);
+        AMediaCodec_delete(mCodec);
+        mCodec = nullptr;
+    }
+    mInitialized = false;
+    ALOGI("标记: H.264 解码器已释放");
+}
+
+status_t Camera3H264Decoder::decode(uint8_t* data, size_t size) {
+    if (!mInitialized) return INVALID_OPERATION;
+
+    ssize_t index = AMediaCodec_dequeueInputBuffer(mCodec, 2000);
+    if (index >= 0) {
+        size_t bufSize;
+        uint8_t* buf = AMediaCodec_getInputBuffer(mCodec, index, &bufSize);
+        if (buf && bufSize >= size) {
+            memcpy(buf, data, size);
+            AMediaCodec_queueInputBuffer(mCodec, index, 0, size, 0, 0);
+            ALOGV("标记: 已提交 %zu 字节到解码器", size);
+        } else {
+            ALOGE("标记: 输入缓冲区太小或无效");
+            AMediaCodec_queueInputBuffer(mCodec, index, 0, 0, 0, 0);
+        }
+    } else {
+        ALOGW("标记: 解码器忙，无可用输入缓冲区");
+    }
+
+    processOutput();
+    return OK;
+}
+
+void Camera3H264Decoder::processOutput() {
+    AMediaCodecBufferInfo info;
+    ssize_t index = AMediaCodec_dequeueOutputBuffer(mCodec, &info, 0);
+    while (index >= 0) {
+        if (info.size > 0) {
+            size_t outBufSize;
+            uint8_t* outBuf = AMediaCodec_getOutputBuffer(mCodec, index, &outBufSize);
+            // 这里我们拿到了 NV21 (或类似) 的原始帧
+            ALOGI("标记: 解码出一帧，大小: %d 字节", info.size);
+            
+            // TODO: (Phase 6) 将帧数据喂给虚拟摄像头
+        }
+        AMediaCodec_releaseOutputBuffer(mCodec, index, false);
+        index = AMediaCodec_dequeueOutputBuffer(mCodec, &info, 0);
+    }
+
+    if (index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+        AMediaFormat* format = AMediaCodec_getOutputFormat(mCodec);
+        ALOGI("标记: 解码格式已更改: %s", AMediaFormat_toString(format));
+        AMediaFormat_delete(format);
+    }
+}
+
+} // namespace camera3
+} // namespace android
+// 个人修改结束
+

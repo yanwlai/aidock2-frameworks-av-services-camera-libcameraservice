@@ -1,0 +1,59 @@
+/*
+ * Copyright (C) 2026 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// 个人修改开始
+#ifndef ANDROID_SERVERS_CAMERA_CAMERA3_H264_DECODER_H
+#define ANDROID_SERVERS_CAMERA_CAMERA3_H264_DECODER_H
+
+#include <utils/RefBase.h>
+#include <utils/Errors.h>
+#include <media/NdkMediaCodec.h>
+#include <media/NdkMediaFormat.h>
+
+namespace android {
+namespace camera3 {
+
+/**
+ * 硬件加速的 H.264 解码器，封装了 MediaCodec。
+ */
+class Camera3H264Decoder : public virtual RefBase {
+public:
+    Camera3H264Decoder();
+    virtual ~Camera3H264Decoder();
+
+    // 初始化解码器 (支持动态宽高)
+    status_t initialize(uint32_t width = 1080, uint32_t height = 720);
+    // 重新配置解码器宽高
+    status_t reconfigure(uint32_t width, uint32_t height);
+    // 释放解码器
+    void release();
+
+    // 提交 NAL 单元进行解码
+    status_t decode(uint8_t* data, size_t size);
+
+private:
+    AMediaCodec* mCodec;
+    bool mInitialized;
+
+    void processOutput();
+};
+
+} // namespace camera3
+} // namespace android
+
+#endif // ANDROID_SERVERS_CAMERA_CAMERA3_H264_DECODER_H
+// 个人修改结束
+
