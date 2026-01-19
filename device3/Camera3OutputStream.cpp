@@ -426,46 +426,129 @@ status_t Camera3OutputStream::returnBufferCheckedLocked(
 
             // 如果有视频流且处于激活状态，显示视频
             if (frame && frame->data.size() > 0 && injectMgr->isInjectionActive()) {
-                // 个人修改：简化版注入逻辑（无需旋转，因为 transform 已强制为 0）
+                // 个人修改开始：基于 transform 逆向补偿的自适应旋转方案
                 int srcW = frame->width;
                 int srcH = frame->height;
-                uint8_t* srcY = frame->data.data();
-                uint8_t* srcUV = srcY + srcW * srcH;
+                uint8_t* srcData = frame->data.data();
+                
+                // 1. 获取系统 transform 要求的旋转角度
+                int transformRotation = 0;
+                if ((transform & 0x07) == HAL_TRANSFORM_ROT_90) transformRotation = 90;
+                else if ((transform & 0x07) == HAL_TRANSFORM_ROT_180) transformRotation = 180;
+                else if ((transform & 0x07) == HAL_TRANSFORM_ROT_270) transformRotation = 270;
 
-                // 计算裁剪区域以适配目标比例
+                // 2. 计算补偿角度：目标是抵消系统的 transform 变换
+                // 补偿角度 = (360 - 系统旋转角度) % 360
+                int compensationRotation = (360 - transformRotation) % 360;
+
+                // 3. 如果源视频是横向的，我们需要额外增加一次旋转将其“转正”为竖向
+                int finalRotation = compensationRotation;
+                // if (srcW > srcH) {
+                //     // 通常横向源视频需要再逆时针转 90 度 (即 +270)
+                //     finalRotation = (compensationRotation + 270) % 360;
+                // }
+
+                libyuv::RotationMode rotationMode = libyuv::kRotate0;
+                if (finalRotation == 90) rotationMode = libyuv::kRotate90;
+                else if (finalRotation == 180) rotationMode = libyuv::kRotate180;
+                else if (finalRotation == 270) rotationMode = libyuv::kRotate270;
+
+                bool shouldRotate = (finalRotation != 0);
+                std::vector<uint8_t> rotateBuf;
+                int effectiveW = srcW;
+                int effectiveH = srcH;
+                uint8_t* curY = srcData;
+                uint8_t* curUV = srcData + srcW * srcH;
+                int curStride = srcW;
+
+                if (shouldRotate) {
+                    rotateBuf.resize(frame->data.size());
+                    uint8_t* dstRY = rotateBuf.data();
+                    uint8_t* dstRUV = dstRY + srcW * srcH;
+                    
+                    libyuv::RotatePlane(
+                        curY, srcW,
+                        dstRY, (rotationMode == libyuv::kRotate180) ? srcW : srcH,
+                        srcW, srcH,
+                        rotationMode
+                    );
+                    
+                    uint16_t* srcUV16 = (uint16_t*)curUV;
+                    uint16_t* dstUV16 = (uint16_t*)dstRUV;
+                    int srcUVH = srcH / 2;
+                    int srcUVW = srcW / 2;
+                    
+                    // 动态 UV 旋转逻辑
+                    if (rotationMode == libyuv::kRotate90) {
+                        int dstUVW = srcUVH;
+                        for (int y = 0; y < srcUVH; ++y) {
+                            for (int x = 0; x < srcUVW; ++x) {
+                                dstUV16[x * dstUVW + (srcUVH - 1 - y)] = srcUV16[y * srcUVW + x];
+                            }
+                        }
+                        effectiveW = srcH; effectiveH = srcW; curStride = srcH;
+                    } else if (rotationMode == libyuv::kRotate180) {
+                        int dstUVW = srcUVW;
+                        for (int y = 0; y < srcUVH; ++y) {
+                            for (int x = 0; x < srcUVW; ++x) {
+                                dstUV16[(srcUVH - 1 - y) * dstUVW + (srcUVW - 1 - x)] = srcUV16[y * srcUVW + x];
+                            }
+                        }
+                        effectiveW = srcW; effectiveH = srcH; curStride = srcW;
+                    } else if (rotationMode == libyuv::kRotate270) {
+                        int dstUVW = srcUVH;
+                        for (int y = 0; y < srcUVH; ++y) {
+                            for (int x = 0; x < srcUVW; ++x) {
+                                dstUV16[(srcUVW - 1 - x) * dstUVW + y] = srcUV16[y * srcUVW + x];
+                            }
+                        }
+                        effectiveW = srcH; effectiveH = srcW; curStride = srcH;
+                    }
+                    
+                    curY = dstRY;
+                    curUV = dstRUV;
+                }
+                // ... 个人修改结束
+                // ... 个人修改结束
+                // ... 后续裁剪缩放逻辑保持不变 ...
+                // 个人修改结束
+                // ... 后续裁剪缩放逻辑保持不变 ...
+                // 个人修改结束
+
+                // 2. 在旋转后的基础上确定裁剪区域 (以适配屏幕比例 w/h)
                 float dstAspect = (float)w / h;
                 int cropW, cropH;
                 int cropX = 0, cropY = 0;
 
-                if ((float)srcW / srcH > dstAspect) {
-                    // 源视频太宽，裁剪左右
-                    cropH = srcH;
-                    cropW = (int)(srcH * dstAspect);
-                    cropX = (srcW - cropW) / 2;
+                if ((float)effectiveW / effectiveH > dstAspect) {
+                    // 旋转后依然太宽，裁剪左右
+                    cropH = effectiveH;
+                    cropW = (int)(effectiveH * dstAspect);
+                    cropX = (effectiveW - cropW) / 2;
                 } else {
-                    // 源视频太窄或比例一致，裁剪上下
-                    cropW = srcW;
-                    cropH = (int)(srcW / dstAspect);
-                    cropY = (srcH - cropH) / 2;
+                    // 旋转后太窄或比例一致，裁剪上下
+                    cropW = effectiveW;
+                    cropH = (int)(effectiveW / dstAspect);
+                    cropY = (effectiveH - cropH) / 2;
                 }
 
-                // 确保对齐到 2（NV12 格式要求）
+                // 确保对齐到 2
                 cropX = (cropX / 2) * 2;
                 cropY = (cropY / 2) * 2;
                 cropW = (cropW / 2) * 2;
                 cropH = (cropH / 2) * 2;
 
-                uint8_t* finalSrcY = srcY + cropY * srcW + cropX;
-                uint8_t* finalSrcUV = srcUV + (cropY / 2) * srcW + cropX;
-
+                uint8_t* finalSrcY = curY + cropY * curStride + cropX;
+                uint8_t* finalSrcUV = curUV + (cropY / 2) * curStride + cropX;
+                
                 size_t ySize = w * h;
                 uint8_t* dstY = (uint8_t*)vaddr;
                 uint8_t* dstUV = (uint8_t*)vaddr + ySize;
 
-                // 直接缩放到目标尺寸（无需旋转）
+                // 3. 缩放至全屏
                 libyuv::NV12Scale(
-                    finalSrcY, srcW,
-                    finalSrcUV, srcW,
+                    finalSrcY, curStride,
+                    finalSrcUV, curStride,
                     cropW, cropH,
                     dstY, w,
                     dstUV, w,
@@ -583,10 +666,6 @@ void Camera3OutputStream::dump(int fd, [[maybe_unused]] const Vector<String16> &
 status_t Camera3OutputStream::setTransform(int transform, bool mayChangeMirror, int surfaceId) {
     ATRACE_CALL();
     Mutex::Autolock l(mLock);
-
-    // 个人修改：强制 transform = 0，禁用显示系统旋转
-    // 这样注入的视频无需进行旋转补偿，直接使用正立的视频即可
-    transform = 0;
 
     if (mMirrorMode != OutputConfiguration::MIRROR_MODE_AUTO && mayChangeMirror) {
         // If the mirroring mode is not AUTO, do not allow transform update
