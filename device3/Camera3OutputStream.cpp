@@ -432,6 +432,11 @@ status_t Camera3OutputStream::returnBufferCheckedLocked(
                 int srcH = frame->height;
                 uint8_t* srcData = frame->data.data();
                 
+                // 打印帧信息用于调试
+                ALOGD("视频帧信息: 传入帧[%dx%d, %zu字节] 目标帧[%zux%zu, stride=%zu, %zu字节]",
+                      srcW, srcH, frame->data.size(),
+                      w, h, dstStride, dstStride * h * 3 / 2);
+                
                 // 1. 获取系统 transform 要求的旋转角度
                 int transformRotation = 0;
                 if ((transform & 0x07) == HAL_TRANSFORM_ROT_90) transformRotation = 90;
