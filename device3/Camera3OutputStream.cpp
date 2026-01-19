@@ -419,6 +419,7 @@ status_t Camera3OutputStream::returnBufferCheckedLocked(
             auto frame = injectMgr->getLatestFrame();
             size_t w = gb->getWidth();
             size_t h = gb->getHeight();
+            size_t dstStride = gb->getStride();  // 获取真实的 stride，关键修复！
 
             // 个人修改开始：设置目标分辨率高度与此处一致
             injectMgr->setTargetHeight(h);
@@ -541,31 +542,38 @@ status_t Camera3OutputStream::returnBufferCheckedLocked(
                 uint8_t* finalSrcY = curY + cropY * curStride + cropX;
                 uint8_t* finalSrcUV = curUV + (cropY / 2) * curStride + cropX;
                 
-                size_t ySize = w * h;
+                // 使用真实的 stride 计算目标 Y/UV 位置（关键修复！）
+                size_t dstYSize = dstStride * h;
                 uint8_t* dstY = (uint8_t*)vaddr;
-                uint8_t* dstUV = (uint8_t*)vaddr + ySize;
+                uint8_t* dstUV = (uint8_t*)vaddr + dstYSize;
 
-                // 3. 缩放至全屏
+                // 3. 缩放至全屏（使用真实的 dstStride 而非 w）
                 libyuv::NV12Scale(
                     finalSrcY, curStride,
                     finalSrcUV, curStride,
                     cropW, cropH,
-                    dstY, w,
-                    dstUV, w,
+                    dstY, dstStride,
+                    dstUV, dstStride,
                     w, h,
                     libyuv::kFilterBox
                 );
                 // 个人修改结束
             } else {
                 // 无连接或无数据时，填充绿幕覆盖真实摄像头
-                size_t ySize = w * h;
-                memset(vaddr, 150, ySize); // Y (亮度)
-                uint8_t* uvPtr = reinterpret_cast<uint8_t*>(vaddr) + ySize;
-                for (size_t i = 0; i < ySize / 2; i += 2) {
-                    uvPtr[i]     = 21; // V
-                    uvPtr[i + 1] = 44; // U
+                // 使用真实的 stride 进行填充（关键修复！）
+                uint8_t* yPtr = reinterpret_cast<uint8_t*>(vaddr);
+                for (size_t row = 0; row < h; ++row) {
+                    memset(yPtr + row * dstStride, 150, w);  // Y (亮度)
                 }
-                // ALOGV("标记: 无有效视频流，已填充绿幕覆盖真实摄像头 (%zux%zu)", w, h);
+                size_t dstYSize = dstStride * h;
+                uint8_t* uvPtr = reinterpret_cast<uint8_t*>(vaddr) + dstYSize;
+                for (size_t row = 0; row < h / 2; ++row) {
+                    for (size_t col = 0; col < w; col += 2) {
+                        uvPtr[row * dstStride + col]     = 21; // U
+                        uvPtr[row * dstStride + col + 1] = 44; // V
+                    }
+                }
+                // ALOGV("标记: 无有效视频流，已填充绿幕覆盖真实摄像头 (%zux%zu, stride=%zu)", w, h, dstStride);
             }
             gb->unlock();
         } else {
